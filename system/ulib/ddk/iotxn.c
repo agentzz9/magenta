@@ -35,6 +35,7 @@
 #define IOTXN_PFLAG_MMAP       (1 << 3)   // we performed mmap() on this vmo
 #define IOTXN_PFLAG_FREE       (1 << 4)   // this txn has been released
 #define IOTXN_PFLAG_QUEUED     (1 << 5)   // transaction has been queued and not yet released
+#define IOTXN_PFLAG_EXTENTS    (1 << 6)   // phys describes extents, not pages
 
 #define IOTXN_STATE_MASK       (IOTXN_PFLAG_FREE | IOTXN_PFLAG_QUEUED)
 
@@ -44,6 +45,12 @@ static mtx_t free_list_mutex = MTX_INIT;
 static size_t free_list_length = 0;
 static size_t free_list_monitor_warned = 0;
 #endif
+
+static mx_handle_t default_bti = MX_HANDLE_INVALID;
+void iotxn_set_default_bti(mx_handle_t bti) {
+    // TODO: locking
+    default_bti = bti;
+}
 
 // This assert will fail if we attempt to access the buffer of a cloned txn after it has been completed
 #define ASSERT_BUFFER_VALID(priv) MX_DEBUG_ASSERT(!(priv->flags & IOTXN_FLAG_DEAD))
@@ -258,16 +265,30 @@ static mx_status_t iotxn_physmap_paged(iotxn_t* txn) {
         return status;
     }
 
-    status = mx_vmo_op_range(txn->vmo_handle, MX_VMO_OP_LOOKUP, page_offset, page_length, paddrs, sizeof(mx_paddr_t) * pages);
-    if (status != MX_OK) {
-        xprintf("iotxn_physmap_paged: error %d in lookup\n", status);
-        free(paddrs);
-        return status;
+    if (default_bti == MX_HANDLE_INVALID) {
+        status = mx_vmo_op_range(txn->vmo_handle, MX_VMO_OP_LOOKUP, page_offset, page_length, paddrs, sizeof(mx_paddr_t) * pages);
+        if (status != MX_OK) {
+            xprintf("iotxn_physmap_paged: error %d in lookup\n", status);
+            free(paddrs);
+            return status;
+        }
+        txn->phys_count = pages;
+    } else {
+        uint32_t actual_extents;
+        status = mx_bti_pin(default_bti, txn->vmo_handle, page_offset, page_length,
+                            MX_VM_FLAG_PERM_READ | MX_VM_FLAG_PERM_WRITE,
+                            paddrs, pages, &actual_extents);
+        if (status != MX_OK) {
+            xprintf("iotxn_physmap_paged: error %d in bti_pin\n", status);
+            free(paddrs);
+            return status;
+        }
+        txn->pflags |= IOTXN_PFLAG_EXTENTS;
+        txn->phys_count = actual_extents;
     }
 
     txn->pflags |= IOTXN_PFLAG_PHYSMAP;
     txn->phys = paddrs;
-    txn->phys_count = pages;
     return MX_OK;
 }
 
@@ -497,6 +518,7 @@ void iotxn_phys_iter_init(iotxn_phys_iter_t* iter, iotxn_t* txn, size_t max_leng
     // iter->page is index of page containing txn->vmo_offset,
     // and iter->last_page is index of page containing txn->vmo_offset + txn->length
     iter->page = 0;
+    iter->subpage = 0;
     if (txn->length > 0) {
         size_t align_adjust = txn->vmo_offset & (PAGE_SIZE - 1);
         iter->last_page = (txn->length + align_adjust - 1) / PAGE_SIZE;
@@ -514,14 +536,15 @@ size_t iotxn_phys_iter_next(iotxn_phys_iter_t* iter, mx_paddr_t* out_paddr) {
         return 0;
     }
     size_t remaining = length - offset;
-    mx_paddr_t* phys_addrs = txn->phys;
-    size_t align_adjust = txn->vmo_offset & (PAGE_SIZE - 1);
-    mx_paddr_t phys = phys_addrs[iter->page];
+    const mx_paddr_t* phys_addrs = txn->phys;
+    const size_t align_adjust = txn->vmo_offset & (PAGE_SIZE - 1);
+    mx_paddr_t phys = ROUNDDOWN(phys_addrs[iter->page], PAGE_SIZE) + PAGE_SIZE * iter->subpage;
+    size_t run_length = (phys_addrs[iter->page] & (PAGE_SIZE - 1)) + 1;
     size_t return_length = 0;
 
     if (txn->phys_count == 1) {
         // simple contiguous case
-        *out_paddr = phys_addrs[0] + offset + align_adjust;
+        *out_paddr = ROUNDDOWN(phys_addrs[0], PAGE_SIZE) + offset + align_adjust;
         return_length = remaining;
         if (return_length > max_length) {
             // end on a page boundary
@@ -538,7 +561,14 @@ size_t iotxn_phys_iter_next(iotxn_phys_iter_t* iter, mx_paddr_t* out_paddr) {
         // alignment for subsequent iterations.
         *out_paddr = phys + align_adjust;
         return_length = PAGE_SIZE - align_adjust;
-        iter->page = 1;
+
+        // Check if this first physical page is part of a run; if so, advance to
+        // the next subpage rather than skipping over the full entry.
+        if (run_length == 1) {
+            iter->page = 1;
+        } else {
+            iter->subpage = 1;
+        }
     } else {
         *out_paddr = phys;
     }
@@ -549,17 +579,31 @@ size_t iotxn_phys_iter_next(iotxn_phys_iter_t* iter, mx_paddr_t* out_paddr) {
     bool discontiguous = false;
 
     // loop through physical addresses looking for discontinuities
-    while (remaining > 0 && return_length < max_length && iter->page++ < iter->last_page) {
-        size_t increment = (PAGE_SIZE > remaining ? remaining : PAGE_SIZE);
+    while (remaining > 0 && return_length < max_length && iter->page < iter->last_page) {
+        const size_t remaining_subpage = (run_length - iter->subpage) * PAGE_SIZE;
+        size_t increment = MIN(MIN(remaining_subpage, remaining), max_length - return_length);
         return_length += increment;
         remaining -= increment;
+        iter->subpage += ROUNDUP(increment, PAGE_SIZE) / PAGE_SIZE;
+
+        if (iter->subpage == run_length) {
+            iter->page++;
+            iter->subpage = 0;
+            MX_DEBUG_ASSERT(iter->subpage < run_length);
+        }
+
+        if (increment != remaining_subpage) {
+            break;
+        }
 
         mx_paddr_t next = phys_addrs[iter->page];
-        if (phys + PAGE_SIZE != next) {
+        if (phys + run_length * PAGE_SIZE != ROUNDDOWN(next, PAGE_SIZE)) {
             discontiguous = true;
             break;
         }
-        phys = next;
+
+        phys = ROUNDDOWN(next, PAGE_SIZE);
+        run_length = next & (PAGE_SIZE - 1);
     }
 
     if (!discontiguous && remaining > 0) {

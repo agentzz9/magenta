@@ -142,6 +142,7 @@ typedef struct {
     mx_off_t    offset;     // current offset in the txn (relative to iotxn vmo_offset)
     size_t      max_length; // max length to be returned by iotxn_phys_iter_next()
     uint64_t    page;       // index of page in txn->phys that contains offset
+    uint64_t    subpage;    // index of subpage in txn->phys that contains offset
     uint64_t    last_page;  // last valid page index in txn->phys
 } iotxn_phys_iter_t;
 
@@ -182,6 +183,9 @@ ssize_t iotxn_copyfrom(iotxn_t* txn, void* data, size_t length, size_t offset);
 // Out of range operations are ignored.
 ssize_t iotxn_copyto(iotxn_t* txn, const void* data, size_t length, size_t offset);
 
+// set the bti to be used when performing physmap
+void iotxn_set_default_bti(mx_handle_t bti);
+
 // iotxn_physmap() looks up the physical pages backing this iotxn's vm object.
 // the 'phys' and 'phys_count' fields are set if this function succeeds.
 mx_status_t iotxn_physmap(iotxn_t* txn);
@@ -195,7 +199,7 @@ static inline mx_paddr_t iotxn_phys(iotxn_t* txn) {
         return 0;
     }
     uint64_t unaligned = (txn->vmo_offset & (PAGE_SIZE - 1));
-    return txn->phys[0] + unaligned;
+    return (txn->phys[0] & ~(PAGE_SIZE - 1)) + unaligned;
 }
 
 // iotxn_mmap() maps the iotxn's vm object and returns the virtual address.
